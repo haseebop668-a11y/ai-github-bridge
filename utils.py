@@ -1,150 +1,105 @@
-import re
 import io
 import zipfile
 import requests
-import json
-import base64
+import re
 import logging
-from typing import Dict, List, Tuple, Optional
-from github import Github, UnknownObjectException, InputGitTreeElement, GithubException
+import base64
+from typing import Iterator, Tuple
 
 logger = logging.getLogger(__name__)
-OLLAMA_URL = "http://localhost:11434/api/generate"
 
-# --- 1. Parsing & Infrastructure ---
-def parse_strict_logs(lines_iter) -> Dict[str, str]:
-    """Strict parser for '# Filename: path' format."""
-    files = {}
-    current_file = None
-    current_content = []
-    header_re = re.compile(r'^# Filename:\s*(.+)$', re.IGNORECASE)
-    
-    for line in lines_iter:
-        line = line.rstrip('\n\r')
-        match = header_re.match(line.strip())
-        if match:
-            if current_file:
-                files[current_file] = "".join(current_content).strip() + '\n'
-            current_file = match.group(1).strip()
-            current_content = []
-        else:
-            if current_file:
-                current_content.append(line + '\n')
-                
-    if current_file:
-        files[current_file] = "".join(current_content).strip() + '\n'
-    return files
-
-def extract_zip(file_bytes: bytes) -> Dict[str, str]:
-    """Robust extraction of text files from ZIP archives."""
-    files = {}
+# --- 1. Memory-Safe Stream Chunking Engine ---
+def stream_zip_files_safely(uploaded_file) -> Iterator[Tuple[str, str]]:
+    """Reads large archives file-by-file from the stream without loading the entire zip into RAM."""
     try:
-        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+        with zipfile.ZipFile(uploaded_file, "r") as z:
             for info in z.infolist():
-                if info.is_dir() or info.filename.startswith('.') or '__MACOSX' in info.filename:
+                if info.is_dir() or info.file_size > 50 * 1024 * 1024: # 50MB Safe Ceiling
                     continue
-                try:
-                    content = z.read(info.filename).decode('utf-8')
-                    files[info.filename] = content
-                except UnicodeDecodeError:
-                    pass # Silently skip binaries
-    except zipfile.BadZipFile:
-        logger.error("Invalid Zip File uploaded.")
-    return files
+                if info.filename.endswith(('.py', '.cpp', '.h', '.rs', '.go', '.java', '.js', '.sh', '.json', '.yaml', '.html', '.css')):
+                    with z.open(info.filename) as f:
+                        content = f.read().decode("utf-8", errors="ignore")
+                        yield info.filename, content
+    except Exception as e:
+        logger.error(f"Zip streaming failure: {str(e)}")
 
-# --- 2. Local LLM (Llama 3) Integration ---
-def check_ollama_status() -> bool:
+# --- 2. OpenRouter API Orchestrator (Zero-Cost Optimized) ---
+def call_openrouter(prompt: str, api_token: str, model: str = "qwen/qwen-2.5-coder-7b-instruct:free") -> Tuple[bool, str]:
+    # Header injection اور ملٹی ٹیننٹ اسپیس میں ڈیٹا کی حفاظت کے لیے سینیٹائزیشن لازمی ہے
+    clean_token = api_token.strip()
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {clean_token}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://enterprise.ai.bridge",
+    }
+    data = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1
+    }
     try:
-        res = requests.get("http://localhost:11434/api/tags", timeout=2)
-        return res.status_code == 200
-    except: return False
-
-def call_ollama(prompt: str, model: str = "llama3") -> Optional[str]:
-    try:
-        response = requests.post(OLLAMA_URL, json={
-            "model": model, "prompt": prompt, "stream": False, "format": "json"
-        }, timeout=180)
+        response = requests.post(url, headers=headers, json=data, timeout=90)
+        
         if response.status_code == 200:
-            return response.json().get("response", "")
-        return None
-    except Exception as e:
-        logger.error(f"Ollama inference failed: {e}")
-        return None
-
-def analyze_code(file_path: str, content: str) -> List[Dict[str, str]]:
-    """Scans code for bugs and requests full corrected code via Llama 3."""
-    # Truncate to ~6000 tokens to respect local LLM context windows
-    safe_content = content[:24000] if len(content) > 24000 else content
-    ext = file_path.split('.')[-1] if '.' in file_path else ""
-    
-    prompt = f"""You are an elite code reviewer. Analyze this {ext} code for bugs, logic errors, or vulnerabilities.
-File: {file_path}
-```{ext}
-{safe_content}
-```
-If issues exist, return a JSON array: [{{"bug": "description", "corrected_code": "the FULL corrected code"}}].
-If perfect, return []. Return ONLY valid JSON."""
-    
-    raw_res = call_ollama(prompt)
-    if not raw_res: return []
-    
-    try:
-        clean_res = raw_res.strip().replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_res)
-    except json.JSONDecodeError:
-        return []
-
-def generate_readme(files: Dict[str, str]) -> str:
-    file_list = ", ".join(list(files.keys())[:20])
-    prompt = f"""Generate a professional, comprehensive README.md in Markdown for a project containing: {file_list}. 
-    Include Overview, Features, and Setup instructions."""
-    return call_ollama(prompt) or "# Project README\n\nGenerated by AI Bridge."
-
-def generate_commit_message(files: Dict[str, str]) -> str:
-    summary = ", ".join([f"{k}" for k in list(files.keys())[:10]])
-    prompt = f"""Write a concise, professional Git commit message for updates to: {summary}."""
-    return call_ollama(prompt) or "feat: autonomous pipeline update"
-
-# --- 3. GitHub Atomic Commits ---
-def commit_to_github(pat: str, repo_name: str, is_private: bool, description: str, 
-                     files_dict: Dict[str, str], commit_msg: str, readme_content: str) -> Tuple[bool, str, Optional[str]]:
-    if readme_content:
-        files_dict["README.md"] = readme_content
-
-    try:
-        g = Github(pat)
-        user = g.get_user()
-        _ = user.login # Force auth check
+            return True, response.json()["choices"][0]["message"]["content"]
+        elif response.status_code == 429:
+            return False, "OpenRouter Rate Limit (429): Free cluster is heavily congested. Please retry in a few seconds."
+        elif response.status_code == 503:
+            return False, "Service Unavailable (503): OpenRouter free tier node is temporarily overloaded."
         
-        try: repo = user.get_repo(repo_name)
-        except UnknownObjectException: repo = user.create_repo(repo_name, private=is_private, description=description)
-            
-        default_branch = repo.default_branch
+        return False, f"API Gate Error {response.status_code}: {response.text}"
+    except requests.exceptions.Timeout:
+        return False, "Gateway Timeout: OpenRouter cluster took too long to compile the refactor pipeline."
+    except Exception as e:
+        return False, f"Network Infrastructure Failure: {str(e)}"
+
+# --- 3. Polyglot Code Block Extractor (Defensive Layer) ---
+def extract_code_blocks(text: str) -> Iterator[Tuple[str, str]]:
+    # پائلٹ ٹیسٹنگ کے دوران فارمیٹس کی لچک برقرار رکھنے کے لیے ریموٹ وائٹ اسپیس میچنگ
+    pattern = r"```(\w*)[ \t]*\r?\n(.*?)```"
+    for match in re.finditer(pattern, text, re.DOTALL):
+        lang, code = match.groups()
+        if code.strip(): 
+            yield lang if lang else "text", code.strip()
+
+# --- 4. Enterprise GitHub Deployment Pipeline (Race-Condition Free) ---
+def commit_to_github(pat: str, repo_name: str, branch: str, file_path: str, content: str, commit_msg: str) -> Tuple[bool, str]:
+    clean_pat = pat.strip()
+    headers = {"Authorization": f"token {clean_pat}", "Accept": "application/vnd.github.v3+json"}
+    base_url = f"https://api.github.com/repos/{repo_name}/contents/{file_path}"
+    
+    # الپٹیمسٹک لاکنگ انشور کرنے کے لیے SHA فیچنگ لک اپ
+    try:
+        get_res = requests.get(base_url, headers=headers, params={"ref": branch}, timeout=15)
+        sha = get_res.json().get("sha") if get_res.status_code == 200 else None
+    except Exception:
+        sha = None # اگر فائل نئی ہے تو بغیر SHA کے آگے بڑھے گا
+    
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+    payload = {
+        "message": commit_msg,
+        "content": encoded_content,
+        "branch": branch
+    }
+    if sha:
+        payload["sha"] = sha
+        
+    try:
+        put_res = requests.put(base_url, headers=headers, json=payload, timeout=20)
+        
+        if put_res.status_code in [200, 201]:
+            return True, put_res.json()["content"]["html_url"]
+        elif put_res.status_code == 409:
+            return False, "Git State Conflict (409): Stale SHA sequence detected. Someone else updated this branch simultaneously. Please retry."
+        
+        # کریش سے بچنے کے لیے جے سن سیف ہینڈلنگ
         try:
-            ref = repo.get_git_ref(f"heads/{default_branch}")
-            sha = ref.object.sha
-            commit = repo.get_git_commit(sha)
-            base_tree = commit.tree
-            parents = [commit]
-        except GithubException as e:
-            if e.status in (404, 409): base_tree, parents = None, []
-            else: raise e
-                
-        tree_elements = []
-        for path, content in files_dict.items():
-            b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
-            blob = repo.create_git_blob(b64, "base64")
-            tree_elements.append(InputGitTreeElement(path, "100644", "blob", sha=blob.sha))
-            
-        new_tree = repo.create_git_tree(tree_elements, base_tree)
-        new_commit = repo.create_git_commit(commit_msg, new_tree, parents)
+            err_details = put_res.json().get("message", "Deployment Failed")
+        except Exception:
+            err_details = f"HTTP Error {put_res.status_code}: {put_res.text}"
+        return False, err_details
         
-        if parents: ref.edit(new_commit.sha)
-        else: repo.create_git_ref(f"refs/heads/{default_branch}", new_commit.sha)
-            
-        return True, repo.html_url, None
-    except GithubException as e:
-        err = e.data.get('message', str(e)) if hasattr(e, 'data') and e.data else str(e)
-        return False, "GitHub API Error", err
     except Exception as e:
-        return False, "Pipeline Error", str(e)
+        return False, f"Secure Pipeline Refused Commit Link: {str(e)}"
+        
