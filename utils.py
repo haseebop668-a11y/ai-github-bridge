@@ -1,117 +1,125 @@
 import re
+import io
+import zipfile
+import requests
+import json
 import base64
 import logging
-from typing import Dict, Iterator, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from github import Github, UnknownObjectException, InputGitTreeElement, GithubException
 
-# Enterprise-grade logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+OLLAMA_URL = "http://localhost:11434/api/generate"
 
-# Extensible Language Mapping. 
-# Fallback to the raw tag if not explicitly mapped to ensure zero hardcoded constraints.
-LANG_MAP = {
-    'python': 'py', 'javascript': 'js', 'typescript': 'ts', 'cpp': 'cpp', 'c++': 'cpp',
-    'c': 'c', 'java': 'java', 'dart': 'dart', 'ruby': 'rb', 'rust': 'rs', 'go': 'go',
-    'html': 'html', 'css': 'css', 'json': 'json', 'yaml': 'yaml', 'yml': 'yaml', 'markdown': 'md',
-    'bash': 'sh', 'shell': 'sh', 'php': 'php', 'swift': 'swift', 'kotlin': 'kt', 'sql': 'sql',
-    'xml': 'xml', 'csv': 'csv', 'toml': 'toml', 'ini': 'ini', 'dockerfile': 'dockerfile'
-}
-
-def parse_chat_logs(lines_iter: Iterator[str]) -> Dict[str, str]:
-    """
-    Stateless processor that parses a stream of lines and extracts code blocks.
-    Optimized for high-throughput processing of large contexts (100k+ lines) via generators.
-    
-    Args:
-        lines_iter: An iterator yielding string lines (e.g., from io.StringIO or io.TextIOWrapper).
-        
-    Returns:
-        A dictionary mapping file paths to their extracted string content.
-    """
-    extracted_files = {}
-    pending_file = None
+# --- 1. Parsing & Infrastructure ---
+def parse_strict_logs(lines_iter) -> Dict[str, str]:
+    """Strict parser for '# Filename: path' format."""
+    files = {}
+    current_file = None
     current_content = []
-    in_block = False
-    file_counter = 0
-    
-    # Pre-compile regex for O(1) matching speed per line
-    file_header_re = re.compile(r'^File:\s*(.+)$', re.IGNORECASE)
-    md_fence_re = re.compile(r'^```([^\s]+)?(?:\s+(.+))?$')
+    header_re = re.compile(r'^# Filename:\s*(.+)$', re.IGNORECASE)
     
     for line in lines_iter:
         line = line.rstrip('\n\r')
-        
-        if in_block:
-            if line.strip() == '```':
-                if pending_file:
-                    extracted_files[pending_file] = "".join(current_content).rstrip('\n')
-                pending_file = None
-                current_content = []
-                in_block = False
-            else:
-                current_content.append(line + '\n')
+        match = header_re.match(line.strip())
+        if match:
+            if current_file:
+                files[current_file] = "".join(current_content).strip() + '\n'
+            current_file = match.group(1).strip()
+            current_content = []
         else:
-            match_a = file_header_re.match(line.strip())
-            if match_a:
-                pending_file = match_a.group(1).strip()
-                continue
+            if current_file:
+                current_content.append(line + '\n')
                 
-            match_b = md_fence_re.match(line.strip())
-            if match_b:
-                lang = match_b.group(1)
-                filename = match_b.group(2)
-                
-                if pending_file:
-                    current_file = pending_file
-                    pending_file = None
-                elif filename:
-                    filename = filename.strip()
-                    if '.' not in filename:
-                        ext = LANG_MAP.get(lang.lower() if lang else 'txt', lang.lower() if lang else 'txt')
-                        current_file = f"{filename}.{ext}"
-                    else:
-                        current_file = filename
-                else:
-                    file_counter += 1
-                    ext = LANG_MAP.get(lang.lower() if lang else 'txt', lang.lower() if lang else 'txt')
-                    current_file = f"file_{file_counter}.{ext}"
-                    
-                in_block = True
-                current_content = []
-                
-    # Edge case: Unclosed block at EOF
-    if in_block and pending_file:
-        extracted_files[pending_file] = "".join(current_content).rstrip('\n')
-        
-    return extracted_files
+    if current_file:
+        files[current_file] = "".join(current_content).strip() + '\n'
+    return files
 
-def commit_to_github(
-    pat: str, 
-    repo_name: str, 
-    is_private: bool, 
-    description: str, 
-    files_dict: Dict[str, str]
-) -> Tuple[bool, str, Optional[str]]:
-    """
-    Pushes extracted files to GitHub using the Git Data API for atomic commits.
+def extract_zip(file_bytes: bytes) -> Dict[str, str]:
+    """Robust extraction of text files from ZIP archives."""
+    files = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            for info in z.infolist():
+                if info.is_dir() or info.filename.startswith('.') or '__MACOSX' in info.filename:
+                    continue
+                try:
+                    content = z.read(info.filename).decode('utf-8')
+                    files[info.filename] = content
+                except UnicodeDecodeError:
+                    pass # Silently skip binaries
+    except zipfile.BadZipFile:
+        logger.error("Invalid Zip File uploaded.")
+    return files
+
+# --- 2. Local LLM (Llama 3) Integration ---
+def check_ollama_status() -> bool:
+    try:
+        res = requests.get("http://localhost:11434/api/tags", timeout=2)
+        return res.status_code == 200
+    except: return False
+
+def call_ollama(prompt: str, model: str = "llama3") -> Optional[str]:
+    try:
+        response = requests.post(OLLAMA_URL, json={
+            "model": model, "prompt": prompt, "stream": False, "format": "json"
+        }, timeout=180)
+        if response.status_code == 200:
+            return response.json().get("response", "")
+        return None
+    except Exception as e:
+        logger.error(f"Ollama inference failed: {e}")
+        return None
+
+def analyze_code(file_path: str, content: str) -> List[Dict[str, str]]:
+    """Scans code for bugs and requests full corrected code via Llama 3."""
+    # Truncate to ~6000 tokens to respect local LLM context windows
+    safe_content = content[:24000] if len(content) > 24000 else content
+    ext = file_path.split('.')[-1] if '.' in file_path else ""
     
-    Returns:
-        Tuple of (success: bool, repo_url_or_error_title: str, error_details: Optional[str])
-    """
+    prompt = f"""You are an elite code reviewer. Analyze this {ext} code for bugs, logic errors, or vulnerabilities.
+File: {file_path}
+```{ext}
+{safe_content}
+```
+If issues exist, return a JSON array: [{{"bug": "description", "corrected_code": "the FULL corrected code"}}].
+If perfect, return []. Return ONLY valid JSON."""
+    
+    raw_res = call_ollama(prompt)
+    if not raw_res: return []
+    
+    try:
+        clean_res = raw_res.strip().replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_res)
+    except json.JSONDecodeError:
+        return []
+
+def generate_readme(files: Dict[str, str]) -> str:
+    file_list = ", ".join(list(files.keys())[:20])
+    prompt = f"""Generate a professional, comprehensive README.md in Markdown for a project containing: {file_list}. 
+    Include Overview, Features, and Setup instructions."""
+    return call_ollama(prompt) or "# Project README\n\nGenerated by AI Bridge."
+
+def generate_commit_message(files: Dict[str, str]) -> str:
+    summary = ", ".join([f"{k}" for k in list(files.keys())[:10]])
+    prompt = f"""Write a concise, professional Git commit message for updates to: {summary}."""
+    return call_ollama(prompt) or "feat: autonomous pipeline update"
+
+# --- 3. GitHub Atomic Commits ---
+def commit_to_github(pat: str, repo_name: str, is_private: bool, description: str, 
+                     files_dict: Dict[str, str], commit_msg: str, readme_content: str) -> Tuple[bool, str, Optional[str]]:
+    if readme_content:
+        files_dict["README.md"] = readme_content
+
     try:
         g = Github(pat)
         user = g.get_user()
-        _ = user.login # Force network evaluation to catch auth errors early
+        _ = user.login # Force auth check
         
-        try:
-            repo = user.get_repo(repo_name)
-        except UnknownObjectException:
-            repo = user.create_repo(repo_name, private=is_private, description=description)
+        try: repo = user.get_repo(repo_name)
+        except UnknownObjectException: repo = user.create_repo(repo_name, private=is_private, description=description)
             
         default_branch = repo.default_branch
-        
-        # Get Base Tree
         try:
             ref = repo.get_git_ref(f"heads/{default_branch}")
             sha = ref.object.sha
@@ -119,38 +127,24 @@ def commit_to_github(
             base_tree = commit.tree
             parents = [commit]
         except GithubException as e:
-            # 409 Conflict or 404 Not Found indicates an empty repository
-            if e.status in (404, 409):
-                base_tree = None
-                parents = []
-            else:
-                raise e
+            if e.status in (404, 409): base_tree, parents = None, []
+            else: raise e
                 
-        if not files_dict:
-            return True, repo.html_url, None
-
-        # Build Tree Elements
         tree_elements = []
         for path, content in files_dict.items():
-            content_bytes = content.encode('utf-8')
-            b64_content = base64.b64encode(content_bytes).decode('ascii')
-            blob = repo.create_git_blob(b64_content, "base64")
+            b64 = base64.b64encode(content.encode('utf-8')).decode('ascii')
+            blob = repo.create_git_blob(b64, "base64")
             tree_elements.append(InputGitTreeElement(path, "100644", "blob", sha=blob.sha))
             
         new_tree = repo.create_git_tree(tree_elements, base_tree)
-        new_commit = repo.create_git_commit("Commit via AI-to-GitHub Bridge", new_tree, parents)
+        new_commit = repo.create_git_commit(commit_msg, new_tree, parents)
         
-        if parents:
-            ref.edit(new_commit.sha)
-        else:
-            repo.create_git_ref(f"refs/heads/{default_branch}", new_commit.sha)
+        if parents: ref.edit(new_commit.sha)
+        else: repo.create_git_ref(f"refs/heads/{default_branch}", new_commit.sha)
             
         return True, repo.html_url, None
-
     except GithubException as e:
-        logger.error(f"GitHub API Exception: {e}")
-        error_msg = e.data.get('message', str(e)) if hasattr(e, 'data') and e.data else str(e)
-        return False, "GitHub API Error", error_msg
+        err = e.data.get('message', str(e)) if hasattr(e, 'data') and e.data else str(e)
+        return False, "GitHub API Error", err
     except Exception as e:
-        logger.error(f"Unexpected Pipeline Error: {e}")
-        return False, "Unexpected Pipeline Error", str(e)
+        return False, "Pipeline Error", str(e)
